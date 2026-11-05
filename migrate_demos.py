@@ -35,7 +35,9 @@ import requests
 from bs4 import BeautifulSoup
 
 HOST = "demoweb.physics.ucla.edu"
-START_URL = "https://demoweb.physics.ucla.edu/content/10-set-first-day-demos"
+# The top of the manual. Its Table of Contents lists every top-level section (1 to 9 and
+# External Resources), so the crawl starts here and works down in the manual's own order.
+START_URL = "https://demoweb.physics.ucla.edu/content/1-mechanics"
 USER_AGENT = "Mozilla/5.0 (compatible; demo-site-migration-script)"
 
 VIDEO_EXT = (".mp4", ".f4v", ".m4v", ".flv", ".webm", ".mov", ".m3u8")
@@ -525,6 +527,7 @@ def write_csv(path, rows, fields):
 # ----------------------------------------------------------------------------
 
 TOC_SELECTOR = "#block-book-navigation"   # the "Table of Contents" box in the left sidebar
+ALIASES = {}    # a page's other address (like .../node/381) -> its main address (.../content/name)
 TOC = {}        # url -> {"title": ..., "parent": url or None}
 CHILDREN = {}   # parent url (None for top level) -> [child urls in menu order]
 
@@ -579,6 +582,65 @@ def toc_rows(saved):
     return rows
 
 
+def node_urls(html_text, page_url):
+    """The page's number address(es), like https://host/node/381. Drupal pages are reachable by
+    name (/content/...) and by number (/node/381), and authors often linked by number."""
+    soup = BeautifulSoup(html_text, "html.parser")
+    found = set()
+    for link in soup.find_all("link", href=True):
+        if "shortlink" in " ".join(link.get("rel") or []):
+            found.add(normalize(urljoin(page_url, link["href"])))
+    if not found:  # fall back to <div id="node-381" ...>
+        for el in soup.find_all(id=re.compile(r"^node-\d+$")):
+            found.add(normalize(urljoin(page_url, "/node/" + el["id"].split("-")[1])))
+    return found
+
+
+def fix_links(page_rows):
+    """Second pass, after the pages are saved: make links between saved pages work.
+
+    The saved pages still contain the site's own addresses ("/content/c-second-law"), which
+    lead nowhere when a page is opened from your computer. A link to a page that was saved now
+    points at that saved file. A link to anything not saved is made a full address on the old
+    site, so it still works while that site is up. Returns (links to saved pages, links left
+    pointing at the old site)."""
+    url_to_file = {p["url"]: p["html_file"] for p in page_rows if p.get("html_file")}
+    to_local = to_old = 0
+    for p in page_rows:
+        path = p.get("html_file")
+        if not path or not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8") as f:
+            soup = BeautifulSoup(f.read(), "html.parser")
+        changed = False
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            # skip in-page anchors, mail links, and links already pointing at downloaded files
+            if not href or href.startswith(("#", "mailto:", "javascript:", "tel:", "../media/")):
+                continue
+            full = urljoin(p["url"], href)
+            target, _, fragment = full.partition("#")
+            norm = normalize(target)
+            saved = url_to_file.get(norm) or url_to_file.get(ALIASES.get(norm, ""))
+            if not saved:  # a number link written another way, e.g. "node/381" or "../node/381"
+                m_node = re.search(r"(?:^|/)node/(\d+)/?$", urlparse(target).path)
+                if m_node:
+                    saved = url_to_file.get(ALIASES.get("https://%s/node/%s" % (HOST, m_node.group(1)), ""))
+            if saved:
+                new = os.path.relpath(saved, os.path.dirname(path)).replace(os.sep, "/")
+                a["href"] = new + ("#" + fragment if fragment else "")
+                to_local += 1
+                changed = True
+            elif href != full:
+                a["href"] = full
+                to_old += 1
+                changed = True
+        if changed:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(str(soup))
+    return to_local, to_old
+
+
 def main():
     ap = argparse.ArgumentParser(description="Export demo pages and their media for migration.")
     ap.add_argument("--start", default=START_URL, help="page to start crawling from")
@@ -608,6 +670,7 @@ def main():
     saved_urls = set()
     done = 0
     stopped_early = False
+    link_counts = (0, 0)
 
     try:
         while queue:
@@ -637,6 +700,8 @@ def main():
                      MATCHED["selector"], prow["text_chars"]))
 
             saved_urls.add(url)
+            for alias in node_urls(r.text, url):
+                ALIASES[alias] = url
 
             # Find more pages, ONLY from the Table of Contents box (not from the page body)
             entries = parse_toc(r.text, url, args.toc_selector)
@@ -659,6 +724,7 @@ def main():
     except KeyboardInterrupt:
         print("\nStopped by you. Saving what was collected so far...")
     finally:
+        link_counts = fix_links(page_rows)
         for p in page_rows:
             t = TOC.get(p["url"])
             path, parent = [], t
@@ -678,6 +744,8 @@ def main():
     failed = sum(1 for m in media_rows if m["status"] == "FAILED")
     print("\nDone. %d pages saved, %d media entries, %d pages need review, %d files failed."
           % (done, len(media_rows), review, failed))
+    print("Links between pages: %d now open the saved copy, %d still point at the old website "
+          "(those pages were not saved in this run)." % link_counts)
     print("Open pages.csv, media.csv and toc.csv in the %s folder to see the details." % args.out)
     unvisited = [r for r in toc_rows(saved_urls) if not r["saved"]]
     if unvisited and not stopped_early:
@@ -689,4 +757,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main())rm
