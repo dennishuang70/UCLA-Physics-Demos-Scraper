@@ -217,6 +217,50 @@ def flash_info(el):
     return swf, fv, el.get("width"), el.get("height")
 
 
+# Old browser plugins that no current browser runs. Chrome shows "This plugin is not supported"
+# for all of them, so they are treated alike: recorded in flash_players.csv, never downloaded.
+PLUGIN_EXT = {".swf": "Flash", ".spl": "Flash", ".dcr": "Shockwave", ".dir": "Shockwave",
+              ".dxr": "Shockwave", ".class": "Java applet", ".jar": "Java applet",
+              ".xap": "Silverlight"}
+PLUGIN_PARAMS = {"movie", "src", "code", "archive", "data", "filename", "url", "source"}
+
+
+def plugin_files(el):
+    """Every file an <embed>/<object>/<applet> names: attributes, <param>s and a nested <embed>."""
+    files = []
+    for t in [el] + el.find_all("embed"):
+        for attr in ("src", "data", "code", "archive", "movie"):
+            if t.get(attr):
+                files.append(t[attr].strip())
+    for p in el.find_all("param"):
+        if (p.get("name") or "").lower() in PLUGIN_PARAMS and p.get("value"):
+            files.append(p["value"].strip())
+    return list(dict.fromkeys(files))
+
+
+def plugin_kind(el):
+    """Which old plugin an <embed>/<object>/<applet> needs: "Flash", "Shockwave", "Java applet",
+    "Silverlight" or "Other plugin". None means it is not a plugin (so it is left alone)."""
+    if el.name == "applet":
+        return "Java applet"
+    types = [(t.get("type") or "").lower() for t in [el] + el.find_all("embed")]
+    text = " ".join(types)
+    classid = (el.get("classid") or "").lower()
+    kinds = [PLUGIN_EXT.get(ext_of(f)) for f in plugin_files(el)]
+    if "shockwave-flash" in text or classid.startswith("clsid:d27cdb6e") or "Flash" in kinds:
+        return "Flash"
+    if "x-director" in text or classid.startswith("clsid:166b1bca") or "Shockwave" in kinds:
+        return "Shockwave"
+    if ("x-java" in text or "java-applet" in text or classid.startswith("clsid:8ad9c840")
+            or "Java applet" in kinds or el.get("code")):
+        return "Java applet"
+    if "silverlight" in text or "Silverlight" in kinds:
+        return "Silverlight"
+    if any(t.startswith("application/x-") and "mpegurl" not in t for t in types):
+        return "Other plugin"
+    return None
+
+
 SWAP_RE = re.compile(r"""swap\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)""")
 
 
@@ -252,38 +296,78 @@ def collect_media(soup, content, page_url):
         items.append(dict(kind=kind, url=urljoin(page_url, u.strip()), note=note,
                           el=el, w=w, h=h))
 
-    # 1. Flash embeds, including JW Player (player.swf + flashvars file=...)
-    for el in content.find_all(["embed", "object"]):
+    def record_plugin(el, pk, how, in_text, replace=True):
+        """Write down an old-plugin embed (never downloaded). The tag is kept (shortened) so you
+        can see exactly what the page contained."""
+        files = plugin_files(el)
+        main = next((f for f in files if ext_of(f) in PLUGIN_EXT), files[0] if files else "")
+        _, fv, w, h = flash_info(el)
+        flash.append(dict(plugin_type=pk, file_url=urljoin(page_url, main) if main else "",
+                          embed_type=how, width=w or "", height=h or "", flashvars=fv or "",
+                          raw_html=" ".join(str(el).split())[:400],
+                          in_saved_text="yes" if in_text else "no",
+                          el=el if (in_text and replace) else None))
+        flags.append("Flash player detected (not extracted)" if pk == "Flash"
+                     else "Unsupported plugin detected (not extracted): " + pk)
+        if not in_text:
+            flags.append("Plugin found outside the saved text area")
+
+    # 1. Old browser plugins: Flash, Shockwave, Java applets, Silverlight, other plugin-only embeds.
+    #    The whole page is searched, not just the saved text. JW Player (player.swf plus
+    #    flashvars file=...) is a video player, not a program, so its video is downloaded.
+    for el in soup.find_all(["embed", "object", "applet"]):
         if el.name == "embed" and el.find_parent("object") is not None:
             continue  # already handled through its parent <object>
-        swf, fv, w, h = flash_info(el)
-        if not swf or ".swf" not in swf.lower():
+        pk = plugin_kind(el)
+        if pk is None:
             continue
+        in_text = any(p is content for p in el.parents)
+        swf, fv, w, h = flash_info(el)
         fvars = parse_flashvars(fv)
         target = (fvars.get("file") or fvars.get("src") or fvars.get("video")
                   or fvars.get("playlistfile") or fvars.get("playlist"))
-        player_name = os.path.basename(urlparse(swf).path).lower()
-        if target and ("player" in player_name or "file" in fvars):
-            kind = "jwplayer-playlist" if ext_of(target) in PLAYLIST_EXT else "jwplayer-video"
-            add(kind, target, "from Flash player embed (%s)" % player_name, el, w, h)
-        else:
-            # A real Flash program, not a media player. Nothing is downloaded: it is only
-            # recorded (flash_players.csv) and marked in the saved page.
-            flash.append(dict(swf_url=urljoin(page_url, swf.strip()), embed_type="object/embed",
-                              width=w or "", height=h or "", flashvars=fv or "", el=el))
-            flags.append("Flash player detected (not extracted)")
+        player_name = os.path.basename(urlparse(swf or "").path).lower()
+        if (pk == "Flash" and swf and ".swf" in swf.lower() and target
+                and ("player" in player_name or "file" in fvars)):
+            if in_text:
+                kind = "jwplayer-playlist" if ext_of(target) in PLAYLIST_EXT else "jwplayer-video"
+                add(kind, target, "from Flash player embed (%s)" % player_name, el, w, h)
+            continue
+        record_plugin(el, pk, "<%s> tag" % el.name, in_text)
 
     # 1b. Flash started from a script, e.g. swfobject.embedSWF("sim.swf", ...)
-    known = {f["swf_url"] for f in flash}
+    known = {(f["plugin_type"], f["file_url"]) for f in flash}
     for s in content.find_all("script"):
         for sm in re.finditer(r"""["']([^"']+\.swf)(?:\?[^"']*)?["']""", s.string or "", re.I):
             u = urljoin(page_url, sm.group(1).strip())
-            if "player" in os.path.basename(urlparse(u).path).lower() or u in known:
+            if "player" in os.path.basename(urlparse(u).path).lower() or ("Flash", u) in known:
                 continue  # a media player, or already recorded
-            known.add(u)
-            flash.append(dict(swf_url=u, embed_type="script (swfobject)", width="", height="",
-                              flashvars="", el=None))
+            known.add(("Flash", u))
+            flash.append(dict(plugin_type="Flash", file_url=u, embed_type="script (swfobject)",
+                              width="", height="", flashvars="",
+                              raw_html=" ".join((s.string or "").split())[:400],
+                              in_saved_text="yes", el=None))
             flags.append("Flash player detected (not extracted)")
+
+    # 1c. A plugin tag written out by a script, e.g. document.write('<embed src="x.dcr" ...>')
+    for s in content.find_all("script"):
+        text = s.string or ""
+        if not re.search(r"<\s*(embed|object|applet)\b", text, re.I):
+            continue
+        written = BeautifulSoup(text.replace('\\"', '"').replace("\\'", "'"), "html.parser")
+        for el in written.find_all(["embed", "object", "applet"]):
+            if el.name == "embed" and el.find_parent("object") is not None:
+                continue
+            pk = plugin_kind(el)
+            if pk is None:
+                continue
+            files = plugin_files(el)
+            main = next((f for f in files if ext_of(f) in PLUGIN_EXT), files[0] if files else "")
+            u = urljoin(page_url, main) if main else ""
+            if (pk, u) in known:
+                continue
+            known.add((pk, u))
+            record_plugin(el, pk, "written by a script", True, replace=False)
 
     # 2. JW Player set up in JavaScript (newer pages)
     for s in soup.find_all("script"):
@@ -406,13 +490,15 @@ def process_page(url, html_text, args, pages_dir, media_dir):
 
     # Flash programs: write them down, download nothing, and leave a note in the saved page
     for fl in flash:
-        FLASH_ROWS.append(dict(page_url=url, page_title=title, swf_url=fl["swf_url"],
-                               embed_type=fl["embed_type"], width=fl["width"], height=fl["height"],
-                               flashvars=fl["flashvars"], status="not extracted"))
+        FLASH_ROWS.append(dict(page_url=url, page_title=title, plugin_type=fl["plugin_type"],
+                               file_url=fl["file_url"], embed_type=fl["embed_type"],
+                               width=fl["width"], height=fl["height"], flashvars=fl["flashvars"],
+                               in_saved_text=fl["in_saved_text"], raw_html=fl["raw_html"],
+                               status="not extracted"))
         if fl["el"] is not None:
-            name = os.path.basename(urlparse(fl["swf_url"]).path).replace("--", "- -")
-            fl["el"].replace_with(Comment(" Flash content (%s) was here; not extracted. "
-                                          "See flash_players.csv " % name))
+            name = (os.path.basename(urlparse(fl["file_url"]).path) or "no file named").replace("--", "- -")
+            fl["el"].replace_with(Comment(" %s content (%s) was here; not extracted. "
+                                          "See flash_players.csv " % (fl["plugin_type"], name)))
 
     def rel(path):
         return os.path.relpath(path, pages_dir).replace(os.sep, "/")
@@ -685,7 +771,7 @@ def write_master(out_dir):
         path = os.path.join(out_dir, name)
         if not os.path.exists(path):
             return None
-        with open(path, newline="", encoding="utf-8") as f:
+        with open(path, newline="", encoding="utf-8-sig") as f:  # -sig: also reads Excel-saved files
             return list(csv.DictReader(f))
 
     toc, pages, media, links = read("toc.csv"), read("pages.csv"), read("media.csv"), read("links.csv")
@@ -716,7 +802,8 @@ def write_master(out_dir):
         fields += ["links_total", "links_to_saved_pages", "links_to_old_site", "links_external",
                    "unresolved_links"]
     if flash is not None:  # a separate group of columns for Flash players (found, not extracted)
-        fields += ["flash_detected", "flash_count", "flash_swf_files", "flash_sizes", "flash_flashvars"]
+        fields += ["flash_detected", "flash_count", "flash_plugin_types", "flash_files", "flash_sizes",
+                   "flash_flashvars"]
 
     rows = []
     for t in toc:
@@ -745,7 +832,8 @@ def write_master(out_dir):
             fs = flash_by_url.get(t["url"], [])
             row["flash_detected"] = ("YES" if fs else "no") if page else ""
             row["flash_count"] = len(fs) if page else ""
-            row["flash_swf_files"] = " | ".join(uniq(x["swf_url"] for x in fs))
+            row["flash_plugin_types"] = " | ".join(uniq(x["plugin_type"] for x in fs))
+            row["flash_files"] = " | ".join(uniq(x["file_url"] for x in fs))
             row["flash_sizes"] = " | ".join(uniq("%sx%s" % (x["width"], x["height"])
                                                  for x in fs if x["width"] and x["height"]))
             row["flash_flashvars"] = " | ".join(uniq(x["flashvars"] for x in fs))
@@ -799,6 +887,7 @@ def main():
     done = 0
     stopped_early = False
     link_counts = (0, 0)
+    master_rows = 0
 
     try:
         while queue:
@@ -855,12 +944,15 @@ def main():
     except KeyboardInterrupt:
         print("\nStopped by you. Saving what was collected so far...")
     finally:
-        link_counts = fix_links(page_rows)
+        try:
+            link_counts = fix_links(page_rows)
+        except Exception as e:  # a link problem must never stop the spreadsheets being written
+            print("Warning: could not fix the links between pages (%r). The spreadsheets are still written." % e)
         write_csv(os.path.join(args.out, "links.csv"), LINK_REPORT,
                   ["page_url", "link_text", "original_href", "status", "new_href"])
         write_csv(os.path.join(args.out, "flash_players.csv"), FLASH_ROWS,
-                  ["page_url", "page_title", "swf_url", "embed_type", "width", "height",
-                   "flashvars", "status"])
+                  ["page_url", "page_title", "plugin_type", "file_url", "embed_type", "width", "height",
+                   "flashvars", "in_saved_text", "raw_html", "status"])
         for p in page_rows:
             t = TOC.get(p["url"])
             path, parent = [], t
@@ -875,7 +967,11 @@ def main():
                    "needs_review", "notes"])
         write_csv(os.path.join(args.out, "media.csv"), media_rows,
                   ["page_url", "kind", "source_url", "local_file", "status", "note"])
-        master_rows = write_master(args.out)
+        try:
+            master_rows = write_master(args.out)
+        except Exception as e:
+            print("Warning: page_statistics.csv could not be built (%r). Run  python migrate_demos.py "
+                  "--master-only  and send me this message if it happens again." % e)
 
     review = sum(1 for p in page_rows if p["needs_review"])
     failed = sum(1 for m in media_rows if m["status"] == "FAILED")
@@ -885,10 +981,15 @@ def main():
           "(those pages were not saved in this run). links.csv lists every link and what happened to it."
           % link_counts)
     print("Open pages.csv, media.csv and toc.csv in the %s folder to see the details." % args.out)
-    print("page_statistics.csv puts all of it together, one row per page (%d rows)." % master_rows)
+    if master_rows:
+        print("page_statistics.csv puts all of it together, one row per page (%d rows)." % master_rows)
+    else:
+        print("page_statistics.csv was NOT written. See the message above.")
     if FLASH_ROWS:
-        print("Flash: %d Flash program(s) found on %d page(s). They were NOT extracted. "
-              "See flash_players.csv." % (len(FLASH_ROWS), len({r["page_url"] for r in FLASH_ROWS})))
+        kinds_found = ", ".join(sorted({r["plugin_type"] for r in FLASH_ROWS}))
+        print("Unsupported plugins (%s): %d found on %d page(s). They were NOT extracted. "
+              "See flash_players.csv." % (kinds_found, len(FLASH_ROWS),
+                                          len({r["page_url"] for r in FLASH_ROWS})))
     unvisited = [r for r in toc_rows(saved_urls) if not r["saved"]]
     if unvisited and not stopped_early:
         print("%d contents entries were not saved (external links or failed pages). See toc.csv."
