@@ -32,7 +32,7 @@ import time
 from urllib.parse import parse_qs, unquote, urldefrag, urljoin, urlparse
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment
 
 HOST = "demoweb.physics.ucla.edu"
 # The top of the manual. Its Table of Contents lists every top-level section (1 to 9 and
@@ -240,9 +240,11 @@ def hover_targets(content, page_url):
 
 
 def collect_media(soup, content, page_url):
-    """Return (items, flags). Each item is a dict describing one file the page uses."""
+    """Return (items, flags, flash). Each item is a dict describing one file the page uses.
+    flash lists the Flash programs found on the page; these are recorded but never downloaded."""
     items = []
     flags = []
+    flash = []
 
     def add(kind, u, note="", el=None, w=None, h=None):
         if not u or u.strip().startswith(("data:", "javascript:", "mailto:", "#")):
@@ -265,12 +267,23 @@ def collect_media(soup, content, page_url):
             kind = "jwplayer-playlist" if ext_of(target) in PLAYLIST_EXT else "jwplayer-video"
             add(kind, target, "from Flash player embed (%s)" % player_name, el, w, h)
         else:
-            add("flash-simulation", swf, "Flash content, needs review. flashvars: %s" % (fv or "none"),
-                None, w, h)
-            flags.append("Flash simulation (.swf)")
-            for v in fvars.values():  # files the SWF is told to load
-                if ext_of(v) in FILE_EXT + PLAYLIST_EXT:
-                    add("flash-companion", v, "file named in flashvars")
+            # A real Flash program, not a media player. Nothing is downloaded: it is only
+            # recorded (flash_players.csv) and marked in the saved page.
+            flash.append(dict(swf_url=urljoin(page_url, swf.strip()), embed_type="object/embed",
+                              width=w or "", height=h or "", flashvars=fv or "", el=el))
+            flags.append("Flash player detected (not extracted)")
+
+    # 1b. Flash started from a script, e.g. swfobject.embedSWF("sim.swf", ...)
+    known = {f["swf_url"] for f in flash}
+    for s in content.find_all("script"):
+        for sm in re.finditer(r"""["']([^"']+\.swf)(?:\?[^"']*)?["']""", s.string or "", re.I):
+            u = urljoin(page_url, sm.group(1).strip())
+            if "player" in os.path.basename(urlparse(u).path).lower() or u in known:
+                continue  # a media player, or already recorded
+            known.add(u)
+            flash.append(dict(swf_url=u, embed_type="script (swfobject)", width="", height="",
+                              flashvars="", el=None))
+            flags.append("Flash player detected (not extracted)")
 
     # 2. JW Player set up in JavaScript (newer pages)
     for s in soup.find_all("script"):
@@ -335,7 +348,7 @@ def collect_media(soup, content, page_url):
         if key not in seen:
             seen.add(key)
             unique.append(it)
-    return unique, flags
+    return unique, flags, flash
 
 
 # ----------------------------------------------------------------------------
@@ -388,8 +401,18 @@ def process_page(url, html_text, args, pages_dir, media_dir):
     title = get_title(soup)
     slug = slug_for(url)
     content = find_content(soup)
-    items, flags = collect_media(soup, content, url)
+    items, flags, flash = collect_media(soup, content, url)
     still_by_name = image_urls_by_name(content, url)  # before any src is rewritten to a local path
+
+    # Flash programs: write them down, download nothing, and leave a note in the saved page
+    for fl in flash:
+        FLASH_ROWS.append(dict(page_url=url, page_title=title, swf_url=fl["swf_url"],
+                               embed_type=fl["embed_type"], width=fl["width"], height=fl["height"],
+                               flashvars=fl["flashvars"], status="not extracted"))
+        if fl["el"] is not None:
+            name = os.path.basename(urlparse(fl["swf_url"]).path).replace("--", "- -")
+            fl["el"].replace_with(Comment(" Flash content (%s) was here; not extracted. "
+                                          "See flash_players.csv " % name))
 
     def rel(path):
         return os.path.relpath(path, pages_dir).replace(os.sep, "/")
@@ -528,6 +551,8 @@ def write_csv(path, rows, fields):
 
 TOC_SELECTOR = "#block-book-navigation"   # the "Table of Contents" box in the left sidebar
 ALIASES = {}    # a page's other address (like .../node/381) -> its main address (.../content/name)
+LINK_REPORT = []  # one row per link in the saved pages, written to links.csv
+FLASH_ROWS = []   # one row per Flash program found (never downloaded), written to flash_players.csv
 TOC = {}        # url -> {"title": ..., "parent": url or None}
 CHILDREN = {}   # parent url (None for top level) -> [child urls in menu order]
 
@@ -626,19 +651,113 @@ def fix_links(page_rows):
                 m_node = re.search(r"(?:^|/)node/(\d+)/?$", urlparse(target).path)
                 if m_node:
                     saved = url_to_file.get(ALIASES.get("https://%s/node/%s" % (HOST, m_node.group(1)), ""))
+            text = a.get_text(" ", strip=True)[:80]
+            same_site = urlparse(full).netloc == HOST
             if saved:
                 new = os.path.relpath(saved, os.path.dirname(path)).replace(os.sep, "/")
                 a["href"] = new + ("#" + fragment if fragment else "")
                 to_local += 1
                 changed = True
+                status = "opens the saved page"
             elif href != full:
                 a["href"] = full
                 to_old += 1
                 changed = True
+                status = "points at old website (page not saved)" if same_site else "external site"
+            else:
+                status = "points at old website (page not saved)" if same_site else "external site"
+            LINK_REPORT.append(dict(page_url=p["url"], link_text=text, original_href=href,
+                                    status=status, new_href=a["href"]))
         if changed:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(str(soup))
     return to_local, to_old
+
+
+def write_master(out_dir):
+    """Join the spreadsheets into page_statistics.csv: one row per page, nothing repeated.
+
+    Left side: toc.csv, so every page in the table of contents gets a row, saved or not.
+    Joined on the page's address: pages.csv (one row per page), media.csv and links.csv (many
+    rows per page, so these are summed up into counts and short lists). The individual
+    spreadsheets are left as they are. Returns the number of rows written."""
+    def read(name):
+        path = os.path.join(out_dir, name)
+        if not os.path.exists(path):
+            return None
+        with open(path, newline="", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+
+    toc, pages, media, links = read("toc.csv"), read("pages.csv"), read("media.csv"), read("links.csv")
+    flash = read("flash_players.csv")
+    if not toc:
+        print("page_statistics.csv was not written: toc.csv is missing or empty.")
+        return 0
+
+    pages_by_url = {p["url"]: p for p in pages or []}
+    media_by_url, links_by_url, flash_by_url = {}, {}, {}
+    for f_row in flash or []:
+        flash_by_url.setdefault(f_row["page_url"], []).append(f_row)
+    for m_row in media or []:
+        media_by_url.setdefault(m_row["page_url"], []).append(m_row)
+    for l_row in links or []:
+        links_by_url.setdefault(l_row["page_url"], []).append(l_row)
+    kinds = sorted({m_row["kind"] for m_row in media or []})
+
+    def uniq(seq):
+        return list(dict.fromkeys(x for x in seq if x))
+
+    fields = ["order", "depth", "path", "title", "url", "saved",
+              "html_file", "text_file", "text_chars", "needs_review", "notes"]
+    if media is not None:
+        fields += ["media_total", "media_failed"] + ["media_" + k for k in kinds] + \
+                  ["media_files", "failed_media", "media_notes"]
+    if links is not None:
+        fields += ["links_total", "links_to_saved_pages", "links_to_old_site", "links_external",
+                   "unresolved_links"]
+    if flash is not None:  # a separate group of columns for Flash players (found, not extracted)
+        fields += ["flash_detected", "flash_count", "flash_swf_files", "flash_sizes", "flash_flashvars"]
+
+    rows = []
+    for t in toc:
+        page = pages_by_url.get(t["url"])
+        row = {k: t.get(k, "") for k in ("order", "depth", "path", "title", "url", "saved")}
+        for k in ("html_file", "text_file", "text_chars", "needs_review", "notes"):
+            row[k] = page.get(k, "") if page else ""
+        if media is not None:
+            ms = media_by_url.get(t["url"], [])
+            row["media_total"] = len(ms) if page else ""
+            row["media_failed"] = sum(1 for x in ms if x["status"] == "FAILED") if page else ""
+            for k in kinds:
+                row["media_" + k] = sum(1 for x in ms if x["kind"] == k) if page else ""
+            row["media_files"] = " | ".join(uniq(x["local_file"] for x in ms))
+            row["failed_media"] = " | ".join(uniq(x["source_url"] for x in ms if x["status"] == "FAILED"))
+            row["media_notes"] = " | ".join(uniq(x["note"] for x in ms))
+        if links is not None:
+            ls = links_by_url.get(t["url"], [])
+            row["links_total"] = len(ls) if page else ""
+            row["links_to_saved_pages"] = sum(1 for x in ls if x["status"] == "opens the saved page") if page else ""
+            row["links_to_old_site"] = sum(1 for x in ls if x["status"].startswith("points at old website")) if page else ""
+            row["links_external"] = sum(1 for x in ls if x["status"] == "external site") if page else ""
+            row["unresolved_links"] = " | ".join(uniq(x["original_href"] for x in ls
+                                                      if x["status"].startswith("points at old website")))
+        if flash is not None:
+            fs = flash_by_url.get(t["url"], [])
+            row["flash_detected"] = ("YES" if fs else "no") if page else ""
+            row["flash_count"] = len(fs) if page else ""
+            row["flash_swf_files"] = " | ".join(uniq(x["swf_url"] for x in fs))
+            row["flash_sizes"] = " | ".join(uniq("%sx%s" % (x["width"], x["height"])
+                                                 for x in fs if x["width"] and x["height"]))
+            row["flash_flashvars"] = " | ".join(uniq(x["flashvars"] for x in fs))
+        rows.append(row)
+
+    write_csv(os.path.join(out_dir, "page_statistics.csv"), rows, fields)
+    toc_urls = {t["url"] for t in toc}
+    left_out = [u for u in pages_by_url if u not in toc_urls]
+    if left_out:
+        print("Note: %d page(s) in pages.csv are not in toc.csv, so they are not in page_statistics.csv."
+              % len(left_out))
+    return len(rows)
 
 
 def main():
@@ -652,12 +771,21 @@ def main():
     ap.add_argument("--selector", default="",
                     help="CSS selector of the box holding the page text, e.g. 'div.content'. "
                          "Tried before the built-in guesses.")
+    ap.add_argument("--master-only", action="store_true",
+                    help="do not crawl; just rebuild page_statistics.csv from the spreadsheets "
+                         "already in the output folder")
     ap.add_argument("--out", default="demo_export", help="output folder")
     ap.add_argument("--delay", type=float, default=1.0, help="seconds to wait between requests")
     ap.add_argument("--wayback-ts", default="2023",
                     help="Wayback timestamp or year used when a file is missing (default 2023)")
     args = ap.parse_args()
     USER_SELECTOR["value"] = args.selector
+
+    if args.master_only:
+        n = write_master(args.out)
+        if n:
+            print("Wrote %s with %d pages." % (os.path.join(args.out, "page_statistics.csv"), n))
+        return
 
     pages_dir = os.path.join(args.out, "pages")
     media_dir = os.path.join(args.out, "media")
@@ -702,6 +830,9 @@ def main():
             saved_urls.add(url)
             for alias in node_urls(r.text, url):
                 ALIASES[alias] = url
+            final = normalize(getattr(r, "url", url))  # the site redirected this address elsewhere
+            if final != url:
+                ALIASES[final] = url
 
             # Find more pages, ONLY from the Table of Contents box (not from the page body)
             entries = parse_toc(r.text, url, args.toc_selector)
@@ -725,6 +856,11 @@ def main():
         print("\nStopped by you. Saving what was collected so far...")
     finally:
         link_counts = fix_links(page_rows)
+        write_csv(os.path.join(args.out, "links.csv"), LINK_REPORT,
+                  ["page_url", "link_text", "original_href", "status", "new_href"])
+        write_csv(os.path.join(args.out, "flash_players.csv"), FLASH_ROWS,
+                  ["page_url", "page_title", "swf_url", "embed_type", "width", "height",
+                   "flashvars", "status"])
         for p in page_rows:
             t = TOC.get(p["url"])
             path, parent = [], t
@@ -739,14 +875,20 @@ def main():
                    "needs_review", "notes"])
         write_csv(os.path.join(args.out, "media.csv"), media_rows,
                   ["page_url", "kind", "source_url", "local_file", "status", "note"])
+        master_rows = write_master(args.out)
 
     review = sum(1 for p in page_rows if p["needs_review"])
     failed = sum(1 for m in media_rows if m["status"] == "FAILED")
     print("\nDone. %d pages saved, %d media entries, %d pages need review, %d files failed."
           % (done, len(media_rows), review, failed))
     print("Links between pages: %d now open the saved copy, %d still point at the old website "
-          "(those pages were not saved in this run)." % link_counts)
+          "(those pages were not saved in this run). links.csv lists every link and what happened to it."
+          % link_counts)
     print("Open pages.csv, media.csv and toc.csv in the %s folder to see the details." % args.out)
+    print("page_statistics.csv puts all of it together, one row per page (%d rows)." % master_rows)
+    if FLASH_ROWS:
+        print("Flash: %d Flash program(s) found on %d page(s). They were NOT extracted. "
+              "See flash_players.csv." % (len(FLASH_ROWS), len({r["page_url"] for r in FLASH_ROWS})))
     unvisited = [r for r in toc_rows(saved_urls) if not r["saved"]]
     if unvisited and not stopped_early:
         print("%d contents entries were not saved (external links or failed pages). See toc.csv."
